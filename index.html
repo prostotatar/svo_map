@@ -7,16 +7,29 @@
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
   <style>
     html,body,#map{height:100%;margin:0}
-    #panel{position:absolute;top:10px;left:60px;z-index:1000;width:250px;padding:10px;display:flex;flex-direction:column;gap:8px;
+    #panel{position:absolute;top:10px;left:60px;z-index:1000;width:280px;max-height:calc(100% - 40px);overflow:auto;padding:10px;display:flex;flex-direction:column;gap:8px;
       background:#fff;color:#222;border:1px solid #bbb;border-radius:6px;font:13px system-ui,sans-serif}
     #panel[hidden]{display:none}
-    #panel .row{display:flex;gap:6px;flex-wrap:wrap}
+    .row{display:flex;gap:6px;flex-wrap:wrap}
     #panel button{flex:1 1 auto;padding:6px 8px;border:1px solid #888;border-radius:4px;background:#f3f3f3;cursor:pointer;font:inherit}
     #panel button.on{background:#1c5fd4;color:#fff;border-color:#1c5fd4}
     #panel label{display:flex;justify-content:space-between;align-items:center;gap:8px}
     #panel input[type=range]{width:120px}
+    #panel input[type=text]{flex:1;padding:4px;font:inherit}
     #info{color:#444;min-height:3em}
     #note{color:#777;font-size:12px}
+    .lay{border:1px solid #ccc;border-radius:4px;margin-bottom:4px}
+    .lay.act{border-color:#1c5fd4}
+    .lay.over{background:#e8f0fe}
+    .lh{display:flex;gap:6px;align-items:center;padding:4px 6px;background:#f3f3f3;cursor:pointer}
+    .lh b{flex:1;font-weight:600}
+    #panel .lh button{flex:0 0 auto;padding:0 6px}
+    .ob{display:flex;gap:6px;align-items:center;padding:3px 6px 3px 14px;cursor:grab}
+    .ob.sel{background:#dbe7ff}
+    .sw{width:12px;height:12px;border:1px solid #666;flex:none}
+    .h{background:#fff;border:2px solid #1c5fd4;border-radius:2px;box-sizing:border-box}
+    .m{background:#1c5fd4;opacity:.45;border-radius:50%}
+    .c{background:#1c5fd4;border:2px solid #fff;border-radius:50%;box-sizing:border-box}
   </style>
 </head>
 <body>
@@ -29,18 +42,22 @@
       <button data-mode="arrow">Стрелка</button>
       <button data-mode="ruler">Линейка</button>
     </div>
+    <div id="info"></div>
+    <label>Название <input type="text" id="name"></label>
     <label>Цвет <input type="color" id="color" value="#e03131"></label>
     <label>Прозрачность заливки <input type="range" id="op" min="0" max="1" step="0.05" value="0.4"></label>
     <label>Толщина линии <input type="range" id="wt" min="1" max="15" step="1" value="3"></label>
+    <label>Прилипание к углам и линиям <input type="checkbox" id="snap" checked></label>
     <div class="row">
       <button id="done">Завершить</button>
       <button id="del">Удалить выбранное</button>
     </div>
+    <div id="layers"></div>
+    <button id="addlay">+ Слой</button>
     <div class="row">
       <button id="copy">Скопировать данные</button>
       <button id="reset">Сбросить черновик</button>
     </div>
-    <div id="info"></div>
     <div id="note"></div>
   </div>
 
@@ -49,219 +66,348 @@
   <script>
     const EDIT = new URLSearchParams(location.search).get('edit') === '1';
     const FILE = 'data/drawings.geojson';
-    const KEY = 'svo-draft';
+    const KEY = 'svo-draft2';
+    const NAMES = { polygon: 'Территория', line: 'Линия', arrow: 'Стрелка' };
 
-    // --- Карта и слои ---
-    const street = L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
-      maxZoom: 19, attribution: '© OpenStreetMap'
-    });
-    const sat = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
-      maxZoom: 18, attribution: 'Tiles © Esri'
-    });
+    // --- Карта ---
+    const street = L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19, attribution: '© OpenStreetMap' });
+    const sat = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', { maxZoom: 18, attribution: 'Tiles © Esri' });
     const map = L.map('map', { center: [48.5, 37.5], zoom: 6, layers: [street] });
     L.control.layers({ 'Карта': street, 'Спутник': sat }).addTo(map);
 
-    fetch('data/events.geojson')
-      .then(r => r.json())
-      .then(d => L.geoJSON(d, {
-        onEachFeature: (f, l) => l.bindPopup('<b>' + f.properties.title + '</b><br>' + f.properties.date)
-      }).addTo(map))
-      .catch(() => {});
+    fetch('data/events.geojson').then(r => r.json()).then(d => L.geoJSON(d, {
+      onEachFeature: (f, l) => l.bindPopup('<b>' + f.properties.title + '</b><br>' + f.properties.date)
+    }).addTo(map)).catch(() => {});
 
-    // --- Нарисованные объекты ---
-    const drawn = L.featureGroup().addTo(map);
-    const decors = L.layerGroup().addTo(map);
+    // --- Данные ---
     const cur = { color: '#e03131', weight: 3, opacity: 0.4 };
-    let selected = null;
+    let layers = [], objs = [], selected = null, activeId = 1, nextL = 1, nextO = 1, dragO = null;
+    let mode = 'select', pts = [], tmp = null, rpts = [], rline = null, rdots = [];
+    const hgrp = L.layerGroup().addTo(map);
 
     const polyStyle = m => ({ color: m.color, weight: m.weight, opacity: 1, fillColor: m.color, fillOpacity: m.opacity });
     const lineStyle = m => ({ color: m.color, weight: m.weight, opacity: 1 });
+    const layerById = id => layers.find(l => l.id === id) || layers[0];
+    const getPts = s => s._meta.kind === 'polygon' ? s.getLatLngs()[0].slice() : s.getLatLngs().slice();
 
-    function makeArrow(l) {
-      if (l._decor) decors.removeLayer(l._decor);
-      const m = l._meta;
-      l._decor = L.polylineDecorator(l, {
-        patterns: [{
-          offset: '100%', repeat: 0,
-          symbol: L.Symbol.arrowHead({ pixelSize: 10 + m.weight * 2, polygon: true,
-            pathOptions: { stroke: false, fillOpacity: 1, color: m.color } })
-        }]
-      });
-      decors.addLayer(l._decor);
+    function addLayerObj(id, name, visible) {
+      const l = { id: id, name: name, visible: visible, group: L.featureGroup() };
+      if (visible) l.group.addTo(map);
+      layers.push(l);
+      nextL = Math.max(nextL, id + 1);
+      return l;
     }
 
-    function addShape(kind, ll, st) {
-      const meta = { kind: kind, color: st.color, weight: st.weight, opacity: st.opacity };
-      const layer = kind === 'polygon' ? L.polygon(ll, polyStyle(meta)) : L.polyline(ll, lineStyle(meta));
-      layer._meta = meta;
-      layer.addTo(drawn);
-      if (kind === 'arrow') makeArrow(layer);
-      if (EDIT) {
-        layer.on('click', e => {
-          if (mode !== 'select') return;
-          L.DomEvent.stopPropagation(e);
-          selectLayer(layer);
-        });
-      }
-      return layer;
+    function makeArrow(s) {
+      const g = layerById(s._lid).group;
+      if (s._decor) g.removeLayer(s._decor);
+      const m = s._meta;
+      s._decor = L.polylineDecorator(s, { patterns: [{ offset: '100%', repeat: 0,
+        symbol: L.Symbol.arrowHead({ pixelSize: 10 + m.weight * 2, polygon: true,
+          pathOptions: { stroke: false, fillOpacity: 1, color: m.color } }) }] });
+      g.addLayer(s._decor);
+    }
+
+    function setPts(s, a) {
+      s.setLatLngs(s._meta.kind === 'polygon' ? [a] : a);
+      if (s._meta.kind === 'arrow') makeArrow(s);
+    }
+
+    function addShape(kind, ll, st, lid, name) {
+      const lay = layerById(lid);
+      const meta = { kind: kind, color: st.color, weight: st.weight, opacity: st.opacity, name: name || (NAMES[kind] + ' ' + nextO) };
+      const s = kind === 'polygon' ? L.polygon(ll, polyStyle(meta)) : L.polyline(ll, lineStyle(meta));
+      s._meta = meta; s._lid = lay.id; s._id = nextO++;
+      lay.group.addLayer(s);
+      objs.push(s);
+      if (kind === 'arrow') makeArrow(s);
+      if (EDIT) s.on('click', e => {
+        if (mode !== 'select') return;
+        L.DomEvent.stopPropagation(e);
+        selectShape(s);
+      });
+      return s;
+    }
+
+    function removeShape(s) {
+      const g = layerById(s._lid).group;
+      g.removeLayer(s);
+      if (s._decor) g.removeLayer(s._decor);
+      objs = objs.filter(x => x !== s);
+      if (selected === s) { selected = null; hgrp.clearLayers(); }
     }
 
     function toGeo() {
-      const features = [];
-      drawn.eachLayer(l => {
-        const f = l.toGeoJSON(6);
-        f.properties = Object.assign({}, l._meta);
-        features.push(f);
-      });
-      return { type: 'FeatureCollection', features: features };
+      return {
+        type: 'FeatureCollection',
+        layers: layers.map(l => ({ id: l.id, name: l.name, visible: l.visible })),
+        features: objs.map(s => {
+          const f = s.toGeoJSON(6);
+          f.properties = Object.assign({}, s._meta, { layer: s._lid });
+          return f;
+        })
+      };
     }
 
     function load(data) {
+      const ls = data.layers && data.layers.length ? data.layers : [{ id: 1, name: 'Слой 1', visible: true }];
+      ls.forEach(l => addLayerObj(l.id, l.name, l.visible !== false));
+      activeId = layers[0].id;
       (data.features || []).forEach(f => {
         const g = f.geometry, p = f.properties || {};
         if (!g) return;
         const isPoly = g.type === 'Polygon';
         const ll = isPoly ? L.GeoJSON.coordsToLatLngs(g.coordinates, 1)[0] : L.GeoJSON.coordsToLatLngs(g.coordinates, 0);
         addShape(p.kind || (isPoly ? 'polygon' : 'line'), ll, {
-          color: p.color || '#e03131',
-          weight: p.weight || 3,
+          color: p.color || '#e03131', weight: p.weight || 3,
           opacity: p.opacity !== undefined ? p.opacity : 0.4
-        });
+        }, p.layer, p.name);
       });
     }
 
-    if (!EDIT) {
-      fetch(FILE).then(r => r.ok ? r.json() : null).then(d => { if (d) load(d); }).catch(() => {});
+    function save() {
+      if (!EDIT) return;
+      try { localStorage.setItem(KEY, JSON.stringify(toGeo())); } catch (e) {}
     }
 
-    // --- Редактор (только при ?edit=1) ---
-    let mode = 'select', pts = [], tmp = null;
-    let rpts = [], rline = null, rdots = [];
+    // --- Панель ---
+    const $ = id => document.getElementById(id);
+    const panel = $('panel'), info = $('info'), note = $('note');
+    const colorEl = $('color'), opEl = $('op'), wtEl = $('wt'), nameEl = $('name');
+    const btns = Array.from(document.querySelectorAll('[data-mode]'));
+    const HINTS = {
+      select: 'Нажмите на объект, чтобы изменить его: цвет, толщину, название, форму (тяните белые квадраты, нажмите на полупрозрачный кружок, чтобы добавить точку, правый клик по квадрату удаляет точку, синий круг двигает весь объект).',
+      polygon: 'Кликайте по карте, ставя углы. Завершить: двойной клик, правый клик, Enter или кнопка «Завершить». Esc — отмена.',
+      line: 'Кликайте по карте, ставя точки. Завершить: двойной клик, правый клик, Enter или кнопка «Завершить». Esc — отмена.',
+      arrow: 'Кликайте от начала к концу стрелки. Завершить: двойной клик, правый клик, Enter или кнопка «Завершить». Esc — отмена.',
+      ruler: 'Кликайте по точкам маршрута. Esc — убрать измерение.'
+    };
+    const isDraw = () => mode === 'polygon' || mode === 'line' || mode === 'arrow';
+    const mkBtn = (t, f) => { const b = document.createElement('button'); b.textContent = t; b.onclick = f; return b; };
+
+    function syncPanel(m) {
+      colorEl.value = m.color; opEl.value = m.opacity; wtEl.value = m.weight;
+      opEl.disabled = !!m.kind && m.kind !== 'polygon';
+      nameEl.value = m.name || ''; nameEl.disabled = !m.kind;
+    }
+
+    function restyle(s) {
+      const m = s._meta;
+      s.setStyle(m.kind === 'polygon' ? polyStyle(m) : lineStyle(m));
+      s.setStyle({ dashArray: s === selected ? '6 4' : null });
+      if (m.kind === 'arrow') makeArrow(s);
+    }
+
+    function deselect() {
+      if (selected) { const o = selected; selected = null; restyle(o); }
+      hgrp.clearLayers();
+      syncPanel(Object.assign({ kind: '' }, cur));
+      renderList();
+    }
+
+    function selectShape(s) {
+      deselect();
+      selected = s;
+      restyle(s);
+      syncPanel(s._meta);
+      showHandles();
+      renderList();
+    }
+
+    function delSelected() {
+      if (!selected) return;
+      removeShape(selected);
+      syncPanel(Object.assign({ kind: '' }, cur));
+      save(); renderList();
+    }
+
+    function moveTo(s, lid) {
+      if (s._lid === lid) return;
+      const o = layerById(s._lid), n = layerById(lid);
+      [s, s._decor].forEach(x => { if (x) { o.group.removeLayer(x); n.group.addLayer(x); } });
+      s._lid = lid; activeId = lid;
+      save(); renderList();
+    }
+
+    function renderList() {
+      const box = $('layers');
+      box.innerHTML = '';
+      layers.forEach(l => {
+        const d = document.createElement('div');
+        d.className = 'lay' + (l.id === activeId ? ' act' : '');
+        const h = document.createElement('div');
+        h.className = 'lh';
+        const cb = document.createElement('input');
+        cb.type = 'checkbox'; cb.checked = l.visible; cb.title = 'Показать или скрыть слой';
+        cb.onchange = () => {
+          l.visible = cb.checked;
+          if (l.visible) l.group.addTo(map); else map.removeLayer(l.group);
+          save();
+        };
+        const nm = document.createElement('b');
+        nm.textContent = l.name;
+        const ren = mkBtn('✎', () => { const n = prompt('Название слоя', l.name); if (n) { l.name = n; save(); renderList(); } });
+        const del = mkBtn('✕', () => {
+          if (layers.length < 2) { alert('Нужен хотя бы один слой'); return; }
+          if (!confirm('Удалить слой «' + l.name + '» вместе со всеми объектами?')) return;
+          objs.filter(o => o._lid === l.id).forEach(removeShape);
+          map.removeLayer(l.group);
+          layers = layers.filter(x => x !== l);
+          if (activeId === l.id) activeId = layers[0].id;
+          save(); renderList();
+        });
+        h.onclick = ev => { if (ev.target === cb || ev.target.tagName === 'BUTTON') return; activeId = l.id; renderList(); };
+        h.append(cb, nm, ren, del);
+        d.append(h);
+        objs.filter(o => o._lid === l.id).forEach(o => {
+          const r = document.createElement('div');
+          r.className = 'ob' + (o === selected ? ' sel' : '');
+          r.draggable = true;
+          const sw = document.createElement('span');
+          sw.className = 'sw'; sw.style.background = o._meta.color;
+          const t = document.createElement('span');
+          t.textContent = o._meta.name;
+          r.append(sw, t);
+          r.onclick = () => { if (mode === 'select') selectShape(o); };
+          r.ondragstart = ev => { dragO = o; ev.dataTransfer.setData('text/plain', String(o._id)); };
+          d.append(r);
+        });
+        d.ondragover = ev => { ev.preventDefault(); d.classList.add('over'); };
+        d.ondragleave = () => d.classList.remove('over');
+        d.ondrop = ev => { ev.preventDefault(); if (dragO) moveTo(dragO, l.id); dragO = null; };
+        box.append(d);
+      });
+    }
+
+    // --- Редактирование формы ---
+    function showHandles() {
+      hgrp.clearLayers();
+      if (!selected) return;
+      const s = selected, a = getPts(s), poly = s._meta.kind === 'polygon';
+      a.forEach((p, i) => {
+        const h = L.marker(p, { draggable: true, icon: L.divIcon({ className: 'h', iconSize: [12, 12] }) }).addTo(hgrp);
+        h.on('drag', e => { const q = snap(e.latlng, s); a[i] = q; h.setLatLng(q); setPts(s, a); });
+        h.on('dragend', () => { save(); showHandles(); });
+        h.on('contextmenu', () => {
+          if (a.length > (poly ? 3 : 2)) { a.splice(i, 1); setPts(s, a); save(); showHandles(); }
+        });
+      });
+      const n = poly ? a.length : a.length - 1;
+      for (let i = 0; i < n; i++) {
+        const p = a[i], q = a[(i + 1) % a.length];
+        const m = L.marker([(p.lat + q.lat) / 2, (p.lng + q.lng) / 2], { icon: L.divIcon({ className: 'm', iconSize: [10, 10] }) }).addTo(hgrp);
+        m.on('click', () => { a.splice(i + 1, 0, m.getLatLng()); setPts(s, a); save(); showHandles(); });
+      }
+      let last = s.getBounds().getCenter();
+      const cm = L.marker(last, { draggable: true, icon: L.divIcon({ className: 'c', iconSize: [16, 16] }) }).addTo(hgrp);
+      cm.on('drag', e => {
+        const dl = e.latlng.lat - last.lat, dn = e.latlng.lng - last.lng;
+        last = e.latlng;
+        for (let k = 0; k < a.length; k++) a[k] = L.latLng(a[k].lat + dl, a[k].lng + dn);
+        setPts(s, a);
+      });
+      cm.on('dragend', () => { save(); showHandles(); });
+    }
+
+    // --- Прилипание ---
+    function snap(ll, self) {
+      if (!$('snap').checked) return ll;
+      const p = map.latLngToContainerPoint(ll), R = 12;
+      const others = objs.filter(o => o !== self && layerById(o._lid).visible);
+      let best = null, bd = R;
+      others.forEach(o => getPts(o).forEach(v => {
+        const d = p.distanceTo(map.latLngToContainerPoint(v));
+        if (d < bd) { bd = d; best = v; }
+      }));
+      if (best) return L.latLng(best.lat, best.lng);
+      bd = R;
+      others.forEach(o => {
+        const a = getPts(o), n = o._meta.kind === 'polygon' ? a.length : a.length - 1;
+        for (let i = 0; i < n; i++) {
+          const A = map.latLngToContainerPoint(a[i]), B = map.latLngToContainerPoint(a[(i + 1) % a.length]);
+          const q = L.LineUtil.closestPointOnSegment(p, A, B), d = p.distanceTo(q);
+          if (d < bd) { bd = d; best = map.containerPointToLatLng(q); }
+        }
+      });
+      return best || ll;
+    }
+
+    // --- Рисование ---
+    function setMode(m) {
+      mode = m;
+      btns.forEach(b => b.classList.toggle('on', b.dataset.mode === m));
+      map.getContainer().style.cursor = m === 'select' ? '' : 'crosshair';
+      if (m === 'select') map.doubleClickZoom.enable(); else map.doubleClickZoom.disable();
+      info.textContent = HINTS[m];
+    }
+    function clearTemp() { if (tmp) { map.removeLayer(tmp); tmp = null; } }
+    function clearRuler() {
+      if (rline) map.removeLayer(rline);
+      rdots.forEach(d => map.removeLayer(d));
+      rline = null; rdots = []; rpts = [];
+    }
+    function cancel() { clearTemp(); pts = []; clearRuler(); setMode('select'); }
+
+    function redraw(mouse) {
+      clearTemp();
+      const ll = mouse ? pts.concat([mouse]) : pts.slice();
+      const make = (mode === 'polygon' && ll.length > 2) ? L.polygon : L.polyline;
+      tmp = make(ll, { color: cur.color, weight: cur.weight, fillColor: cur.color, fillOpacity: cur.opacity,
+        dashArray: '5 5', interactive: false }).addTo(map);
+    }
+
+    function finish() {
+      const kind = mode, keep = pts.slice();
+      const ok = keep.length >= (kind === 'polygon' ? 3 : 2);
+      cancel();
+      if (ok) { selectShape(addShape(kind, keep, cur, activeId)); save(); }
+    }
+
+    function rulerClick(latlng) {
+      rpts.push(latlng);
+      if (rline) map.removeLayer(rline);
+      rline = L.polyline(rpts, { color: '#111', weight: 2, dashArray: '6 6', interactive: false }).addTo(map);
+      rdots.push(L.circleMarker(latlng, { radius: 4, color: '#111', fillColor: '#fff', fillOpacity: 1, interactive: false }).addTo(map));
+      let m = 0;
+      for (let i = 1; i < rpts.length; i++) m += map.distance(rpts[i - 1], rpts[i]);
+      info.textContent = 'Расстояние: ' + (m / 1000).toFixed(2) + ' км';
+    }
+
+    function onStyle() {
+      cur.color = colorEl.value; cur.opacity = +opEl.value; cur.weight = +wtEl.value;
+      if (selected) {
+        const m = selected._meta;
+        m.color = cur.color; m.weight = cur.weight;
+        if (m.kind === 'polygon') m.opacity = cur.opacity;
+        restyle(selected);
+        renderList(); save();
+      }
+    }
 
     if (EDIT) {
-      const panel = document.getElementById('panel');
-      const info = document.getElementById('info');
-      const note = document.getElementById('note');
-      const colorEl = document.getElementById('color');
-      const opEl = document.getElementById('op');
-      const wtEl = document.getElementById('wt');
-      const btns = Array.from(document.querySelectorAll('[data-mode]'));
-      const HINTS = {
-        select: 'Нажмите на объект, чтобы изменить его цвет, прозрачность и толщину.',
-        polygon: 'Кликайте по карте, ставя углы территории. Двойной клик или Enter — завершить, Esc — отмена.',
-        line: 'Кликайте по карте, ставя точки линии. Двойной клик или Enter — завершить, Esc — отмена.',
-        arrow: 'Кликайте по карте: от начала к концу стрелки. Двойной клик или Enter — завершить, Esc — отмена.',
-        ruler: 'Кликайте по точкам маршрута. Esc — убрать измерение.'
-      };
       panel.hidden = false;
       L.DomEvent.disableClickPropagation(panel);
       L.DomEvent.disableScrollPropagation(panel);
-
-      const isDraw = () => mode === 'polygon' || mode === 'line' || mode === 'arrow';
-
-      function save() {
-        try { localStorage.setItem(KEY, JSON.stringify(toGeo())); } catch (e) {}
-      }
-
-      function setMode(m) {
-        mode = m;
-        btns.forEach(b => b.classList.toggle('on', b.dataset.mode === m));
-        map.getContainer().style.cursor = m === 'select' ? '' : 'crosshair';
-        if (m === 'select') map.doubleClickZoom.enable(); else map.doubleClickZoom.disable();
-        info.textContent = HINTS[m];
-      }
-
-      function clearTemp() { if (tmp) { map.removeLayer(tmp); tmp = null; } }
-      function clearRuler() {
-        if (rline) map.removeLayer(rline);
-        rdots.forEach(d => map.removeLayer(d));
-        rline = null; rdots = []; rpts = [];
-      }
-      function cancel() { clearTemp(); pts = []; clearRuler(); setMode('select'); }
-
-      function redraw(mouse) {
-        clearTemp();
-        const ll = mouse ? pts.concat([mouse]) : pts.slice();
-        const make = (mode === 'polygon' && ll.length > 2) ? L.polygon : L.polyline;
-        tmp = make(ll, { color: cur.color, weight: cur.weight, fillColor: cur.color, fillOpacity: cur.opacity,
-          dashArray: '5 5', interactive: false }).addTo(map);
-      }
-
-      function finish() {
-        const kind = mode, keep = pts.slice();
-        const ok = keep.length >= (kind === 'polygon' ? 3 : 2);
-        cancel();
-        if (ok) { selectLayer(addShape(kind, keep, cur)); save(); }
-      }
-
-      function rulerClick(latlng) {
-        rpts.push(latlng);
-        if (rline) map.removeLayer(rline);
-        rline = L.polyline(rpts, { color: '#111', weight: 2, dashArray: '6 6', interactive: false }).addTo(map);
-        rdots.push(L.circleMarker(latlng, { radius: 4, color: '#111', fillColor: '#fff', fillOpacity: 1, interactive: false }).addTo(map));
-        let m = 0;
-        for (let i = 1; i < rpts.length; i++) m += map.distance(rpts[i - 1], rpts[i]);
-        info.textContent = 'Расстояние: ' + (m / 1000).toFixed(2) + ' км';
-      }
-
-      function syncPanel(m) {
-        colorEl.value = m.color; opEl.value = m.opacity; wtEl.value = m.weight;
-        opEl.disabled = !!m.kind && m.kind !== 'polygon';
-      }
-
-      function restyle(l) {
-        const m = l._meta;
-        l.setStyle(m.kind === 'polygon' ? polyStyle(m) : lineStyle(m));
-        l.setStyle({ dashArray: l === selected ? '6 4' : null });
-        if (m.kind === 'arrow') makeArrow(l);
-      }
-
-      function deselect() {
-        if (selected) { const old = selected; selected = null; restyle(old); }
-        syncPanel(Object.assign({ kind: '' }, cur));
-      }
-
-      function selectLayer(l) {
-        deselect();
-        selected = l;
-        restyle(l);
-        syncPanel(l._meta);
-      }
-
-      function delSelected() {
-        if (!selected) return;
-        drawn.removeLayer(selected);
-        if (selected._decor) decors.removeLayer(selected._decor);
-        selected = null;
-        save();
-      }
-
-      function onStyle() {
-        cur.color = colorEl.value; cur.opacity = +opEl.value; cur.weight = +wtEl.value;
-        if (selected) {
-          const m = selected._meta;
-          m.color = cur.color; m.weight = cur.weight;
-          if (m.kind === 'polygon') m.opacity = cur.opacity;
-          restyle(selected);
-          save();
-        }
-      }
       colorEl.oninput = wtEl.oninput = opEl.oninput = onStyle;
-
+      nameEl.oninput = () => { if (selected) { selected._meta.name = nameEl.value; save(); renderList(); } };
       btns.forEach(b => b.onclick = () => {
         const m = b.dataset.mode;
         if (mode === m) { cancel(); return; }
         cancel(); deselect(); setMode(m);
       });
-      document.getElementById('done').onclick = () => { if (isDraw()) finish(); };
-      document.getElementById('del').onclick = delSelected;
-      document.getElementById('copy').onclick = () => {
+      $('done').onclick = () => { if (isDraw()) finish(); };
+      $('del').onclick = delSelected;
+      $('addlay').onclick = () => {
+        const n = prompt('Название слоя', 'Слой ' + nextL);
+        if (n) { activeId = addLayerObj(nextL, n, true).id; save(); renderList(); }
+      };
+      $('copy').onclick = () => {
         navigator.clipboard.writeText(JSON.stringify(toGeo(), null, 2)).then(
           () => { info.textContent = 'Скопировано. Вставьте в файл data/drawings.geojson на GitHub.'; },
           () => { info.textContent = 'Не удалось скопировать. Попробуйте ещё раз.'; }
         );
       };
-      document.getElementById('reset').onclick = () => {
+      $('reset').onclick = () => {
         if (confirm('Удалить черновик из этого браузера и загрузить опубликованную версию?')) {
           try { localStorage.removeItem(KEY); } catch (e) {}
           location.reload();
@@ -273,30 +419,33 @@
         if (mode === 'ruler') { rulerClick(e.latlng); return; }
         const last = pts[pts.length - 1];
         if (last && map.latLngToContainerPoint(last).distanceTo(e.containerPoint) < 4) return;
-        pts.push(e.latlng);
+        pts.push(snap(e.latlng));
         redraw(null);
       });
       map.on('dblclick', () => { if (isDraw()) finish(); });
-      map.on('mousemove', e => { if (isDraw() && pts.length) redraw(e.latlng); });
+      map.on('contextmenu', e => { e.originalEvent.preventDefault(); if (isDraw()) finish(); });
+      map.on('mousemove', e => { if (isDraw() && pts.length) redraw(snap(e.latlng)); });
       document.addEventListener('keydown', e => {
         if (e.key === 'Escape') cancel();
         else if (e.key === 'Enter' && isDraw()) finish();
         else if (e.key === 'Delete' && selected && document.activeElement.tagName !== 'INPUT') delSelected();
       });
-
-      // Загрузка: черновик из браузера, а если его нет — опубликованная версия
-      let draft = null;
-      try { draft = localStorage.getItem(KEY); } catch (e) {}
-      let loaded = false;
-      if (draft) {
-        try { load(JSON.parse(draft)); loaded = true; note.textContent = 'Показан черновик из этого браузера.'; } catch (e) {}
-      }
-      if (!loaded) {
-        fetch(FILE).then(r => r.ok ? r.json() : null).then(d => { if (d) load(d); })
-          .catch(() => {}).then(() => { note.textContent = 'Показана опубликованная версия.'; });
-      }
-      setMode('select');
     }
+
+    // --- Загрузка ---
+    async function init() {
+      let d = null;
+      if (EDIT) {
+        try { const t = localStorage.getItem(KEY); if (t) { d = JSON.parse(t); note.textContent = 'Показан черновик из этого браузера.'; } } catch (e) {}
+      }
+      if (!d) {
+        try { const r = await fetch(FILE); if (r.ok) d = await r.json(); } catch (e) {}
+        note.textContent = 'Показана опубликованная версия.';
+      }
+      load(d || {});
+      if (EDIT) { renderList(); setMode('select'); }
+    }
+    init();
   </script>
 </body>
 </html>
