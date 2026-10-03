@@ -5,37 +5,298 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Карта</title>
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
-  <style>html,body,#map{height:100%;margin:0}</style>
+  <style>
+    html,body,#map{height:100%;margin:0}
+    #panel{position:absolute;top:10px;left:60px;z-index:1000;width:250px;padding:10px;display:flex;flex-direction:column;gap:8px;
+      background:#fff;color:#222;border:1px solid #bbb;border-radius:6px;font:13px system-ui,sans-serif}
+    #panel[hidden]{display:none}
+    #panel .row{display:flex;gap:6px;flex-wrap:wrap}
+    #panel button{flex:1 1 auto;padding:6px 8px;border:1px solid #888;border-radius:4px;background:#f3f3f3;cursor:pointer;font:inherit}
+    #panel button.on{background:#1c5fd4;color:#fff;border-color:#1c5fd4}
+    #panel label{display:flex;justify-content:space-between;align-items:center;gap:8px}
+    #panel input[type=range]{width:120px}
+    #info{color:#444;min-height:3em}
+    #note{color:#777;font-size:12px}
+  </style>
 </head>
 <body>
   <div id="map"></div>
+
+  <div id="panel" hidden>
+    <div class="row">
+      <button data-mode="polygon">Территория</button>
+      <button data-mode="line">Линия</button>
+      <button data-mode="arrow">Стрелка</button>
+      <button data-mode="ruler">Линейка</button>
+    </div>
+    <label>Цвет <input type="color" id="color" value="#e03131"></label>
+    <label>Прозрачность заливки <input type="range" id="op" min="0" max="1" step="0.05" value="0.4"></label>
+    <label>Толщина линии <input type="range" id="wt" min="1" max="15" step="1" value="3"></label>
+    <div class="row">
+      <button id="done">Завершить</button>
+      <button id="del">Удалить выбранное</button>
+    </div>
+    <div class="row">
+      <button id="copy">Скопировать данные</button>
+      <button id="reset">Сбросить черновик</button>
+    </div>
+    <div id="info"></div>
+    <div id="note"></div>
+  </div>
+
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script src="https://unpkg.com/leaflet-polylinedecorator@1.6.0/dist/leaflet.polylineDecorator.js"></script>
   <script>
+    const EDIT = new URLSearchParams(location.search).get('edit') === '1';
+    const FILE = 'data/drawings.geojson';
+    const KEY = 'svo-draft';
+
+    // --- Карта и слои ---
     const street = L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
-      maxZoom: 19,
-      attribution: '© OpenStreetMap'
+      maxZoom: 19, attribution: '© OpenStreetMap'
     });
-
     const sat = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
-      maxZoom: 18,
-      attribution: 'Tiles © Esri'
+      maxZoom: 18, attribution: 'Tiles © Esri'
     });
-
-    const map = L.map('map', {
-      center: [48.5, 37.5],
-      zoom: 6,
-      layers: [street]
-    });
-
+    const map = L.map('map', { center: [48.5, 37.5], zoom: 6, layers: [street] });
     L.control.layers({ 'Карта': street, 'Спутник': sat }).addTo(map);
 
     fetch('data/events.geojson')
       .then(r => r.json())
       .then(d => L.geoJSON(d, {
-        onEachFeature: (f, l) => l.bindPopup(
-          '<b>' + f.properties.title + '</b><br>' + f.properties.date
-        )
-      }).addTo(map));
+        onEachFeature: (f, l) => l.bindPopup('<b>' + f.properties.title + '</b><br>' + f.properties.date)
+      }).addTo(map))
+      .catch(() => {});
+
+    // --- Нарисованные объекты ---
+    const drawn = L.featureGroup().addTo(map);
+    const decors = L.layerGroup().addTo(map);
+    const cur = { color: '#e03131', weight: 3, opacity: 0.4 };
+    let selected = null;
+
+    const polyStyle = m => ({ color: m.color, weight: m.weight, opacity: 1, fillColor: m.color, fillOpacity: m.opacity });
+    const lineStyle = m => ({ color: m.color, weight: m.weight, opacity: 1 });
+
+    function makeArrow(l) {
+      if (l._decor) decors.removeLayer(l._decor);
+      const m = l._meta;
+      l._decor = L.polylineDecorator(l, {
+        patterns: [{
+          offset: '100%', repeat: 0,
+          symbol: L.Symbol.arrowHead({ pixelSize: 10 + m.weight * 2, polygon: true,
+            pathOptions: { stroke: false, fillOpacity: 1, color: m.color } })
+        }]
+      });
+      decors.addLayer(l._decor);
+    }
+
+    function addShape(kind, ll, st) {
+      const meta = { kind: kind, color: st.color, weight: st.weight, opacity: st.opacity };
+      const layer = kind === 'polygon' ? L.polygon(ll, polyStyle(meta)) : L.polyline(ll, lineStyle(meta));
+      layer._meta = meta;
+      layer.addTo(drawn);
+      if (kind === 'arrow') makeArrow(layer);
+      if (EDIT) {
+        layer.on('click', e => {
+          if (mode !== 'select') return;
+          L.DomEvent.stopPropagation(e);
+          selectLayer(layer);
+        });
+      }
+      return layer;
+    }
+
+    function toGeo() {
+      const features = [];
+      drawn.eachLayer(l => {
+        const f = l.toGeoJSON(6);
+        f.properties = Object.assign({}, l._meta);
+        features.push(f);
+      });
+      return { type: 'FeatureCollection', features: features };
+    }
+
+    function load(data) {
+      (data.features || []).forEach(f => {
+        const g = f.geometry, p = f.properties || {};
+        if (!g) return;
+        const isPoly = g.type === 'Polygon';
+        const ll = isPoly ? L.GeoJSON.coordsToLatLngs(g.coordinates, 1)[0] : L.GeoJSON.coordsToLatLngs(g.coordinates, 0);
+        addShape(p.kind || (isPoly ? 'polygon' : 'line'), ll, {
+          color: p.color || '#e03131',
+          weight: p.weight || 3,
+          opacity: p.opacity !== undefined ? p.opacity : 0.4
+        });
+      });
+    }
+
+    if (!EDIT) {
+      fetch(FILE).then(r => r.ok ? r.json() : null).then(d => { if (d) load(d); }).catch(() => {});
+    }
+
+    // --- Редактор (только при ?edit=1) ---
+    let mode = 'select', pts = [], tmp = null;
+    let rpts = [], rline = null, rdots = [];
+
+    if (EDIT) {
+      const panel = document.getElementById('panel');
+      const info = document.getElementById('info');
+      const note = document.getElementById('note');
+      const colorEl = document.getElementById('color');
+      const opEl = document.getElementById('op');
+      const wtEl = document.getElementById('wt');
+      const btns = Array.from(document.querySelectorAll('[data-mode]'));
+      const HINTS = {
+        select: 'Нажмите на объект, чтобы изменить его цвет, прозрачность и толщину.',
+        polygon: 'Кликайте по карте, ставя углы территории. Двойной клик или Enter — завершить, Esc — отмена.',
+        line: 'Кликайте по карте, ставя точки линии. Двойной клик или Enter — завершить, Esc — отмена.',
+        arrow: 'Кликайте по карте: от начала к концу стрелки. Двойной клик или Enter — завершить, Esc — отмена.',
+        ruler: 'Кликайте по точкам маршрута. Esc — убрать измерение.'
+      };
+      panel.hidden = false;
+      L.DomEvent.disableClickPropagation(panel);
+      L.DomEvent.disableScrollPropagation(panel);
+
+      const isDraw = () => mode === 'polygon' || mode === 'line' || mode === 'arrow';
+
+      function save() {
+        try { localStorage.setItem(KEY, JSON.stringify(toGeo())); } catch (e) {}
+      }
+
+      function setMode(m) {
+        mode = m;
+        btns.forEach(b => b.classList.toggle('on', b.dataset.mode === m));
+        map.getContainer().style.cursor = m === 'select' ? '' : 'crosshair';
+        if (m === 'select') map.doubleClickZoom.enable(); else map.doubleClickZoom.disable();
+        info.textContent = HINTS[m];
+      }
+
+      function clearTemp() { if (tmp) { map.removeLayer(tmp); tmp = null; } }
+      function clearRuler() {
+        if (rline) map.removeLayer(rline);
+        rdots.forEach(d => map.removeLayer(d));
+        rline = null; rdots = []; rpts = [];
+      }
+      function cancel() { clearTemp(); pts = []; clearRuler(); setMode('select'); }
+
+      function redraw(mouse) {
+        clearTemp();
+        const ll = mouse ? pts.concat([mouse]) : pts.slice();
+        const make = (mode === 'polygon' && ll.length > 2) ? L.polygon : L.polyline;
+        tmp = make(ll, { color: cur.color, weight: cur.weight, fillColor: cur.color, fillOpacity: cur.opacity,
+          dashArray: '5 5', interactive: false }).addTo(map);
+      }
+
+      function finish() {
+        const kind = mode, keep = pts.slice();
+        const ok = keep.length >= (kind === 'polygon' ? 3 : 2);
+        cancel();
+        if (ok) { selectLayer(addShape(kind, keep, cur)); save(); }
+      }
+
+      function rulerClick(latlng) {
+        rpts.push(latlng);
+        if (rline) map.removeLayer(rline);
+        rline = L.polyline(rpts, { color: '#111', weight: 2, dashArray: '6 6', interactive: false }).addTo(map);
+        rdots.push(L.circleMarker(latlng, { radius: 4, color: '#111', fillColor: '#fff', fillOpacity: 1, interactive: false }).addTo(map));
+        let m = 0;
+        for (let i = 1; i < rpts.length; i++) m += map.distance(rpts[i - 1], rpts[i]);
+        info.textContent = 'Расстояние: ' + (m / 1000).toFixed(2) + ' км';
+      }
+
+      function syncPanel(m) {
+        colorEl.value = m.color; opEl.value = m.opacity; wtEl.value = m.weight;
+        opEl.disabled = !!m.kind && m.kind !== 'polygon';
+      }
+
+      function restyle(l) {
+        const m = l._meta;
+        l.setStyle(m.kind === 'polygon' ? polyStyle(m) : lineStyle(m));
+        l.setStyle({ dashArray: l === selected ? '6 4' : null });
+        if (m.kind === 'arrow') makeArrow(l);
+      }
+
+      function deselect() {
+        if (selected) { const old = selected; selected = null; restyle(old); }
+        syncPanel(Object.assign({ kind: '' }, cur));
+      }
+
+      function selectLayer(l) {
+        deselect();
+        selected = l;
+        restyle(l);
+        syncPanel(l._meta);
+      }
+
+      function delSelected() {
+        if (!selected) return;
+        drawn.removeLayer(selected);
+        if (selected._decor) decors.removeLayer(selected._decor);
+        selected = null;
+        save();
+      }
+
+      function onStyle() {
+        cur.color = colorEl.value; cur.opacity = +opEl.value; cur.weight = +wtEl.value;
+        if (selected) {
+          const m = selected._meta;
+          m.color = cur.color; m.weight = cur.weight;
+          if (m.kind === 'polygon') m.opacity = cur.opacity;
+          restyle(selected);
+          save();
+        }
+      }
+      colorEl.oninput = wtEl.oninput = opEl.oninput = onStyle;
+
+      btns.forEach(b => b.onclick = () => {
+        const m = b.dataset.mode;
+        if (mode === m) { cancel(); return; }
+        cancel(); deselect(); setMode(m);
+      });
+      document.getElementById('done').onclick = () => { if (isDraw()) finish(); };
+      document.getElementById('del').onclick = delSelected;
+      document.getElementById('copy').onclick = () => {
+        navigator.clipboard.writeText(JSON.stringify(toGeo(), null, 2)).then(
+          () => { info.textContent = 'Скопировано. Вставьте в файл data/drawings.geojson на GitHub.'; },
+          () => { info.textContent = 'Не удалось скопировать. Попробуйте ещё раз.'; }
+        );
+      };
+      document.getElementById('reset').onclick = () => {
+        if (confirm('Удалить черновик из этого браузера и загрузить опубликованную версию?')) {
+          try { localStorage.removeItem(KEY); } catch (e) {}
+          location.reload();
+        }
+      };
+
+      map.on('click', e => {
+        if (mode === 'select') { deselect(); return; }
+        if (mode === 'ruler') { rulerClick(e.latlng); return; }
+        const last = pts[pts.length - 1];
+        if (last && map.latLngToContainerPoint(last).distanceTo(e.containerPoint) < 4) return;
+        pts.push(e.latlng);
+        redraw(null);
+      });
+      map.on('dblclick', () => { if (isDraw()) finish(); });
+      map.on('mousemove', e => { if (isDraw() && pts.length) redraw(e.latlng); });
+      document.addEventListener('keydown', e => {
+        if (e.key === 'Escape') cancel();
+        else if (e.key === 'Enter' && isDraw()) finish();
+        else if (e.key === 'Delete' && selected && document.activeElement.tagName !== 'INPUT') delSelected();
+      });
+
+      // Загрузка: черновик из браузера, а если его нет — опубликованная версия
+      let draft = null;
+      try { draft = localStorage.getItem(KEY); } catch (e) {}
+      let loaded = false;
+      if (draft) {
+        try { load(JSON.parse(draft)); loaded = true; note.textContent = 'Показан черновик из этого браузера.'; } catch (e) {}
+      }
+      if (!loaded) {
+        fetch(FILE).then(r => r.ok ? r.json() : null).then(d => { if (d) load(d); })
+          .catch(() => {}).then(() => { note.textContent = 'Показана опубликованная версия.'; });
+      }
+      setMode('select');
+    }
   </script>
 </body>
 </html>
