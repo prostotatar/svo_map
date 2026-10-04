@@ -48,6 +48,11 @@
     <label>Прозрачность заливки <input type="range" id="op" min="0" max="1" step="0.05" value="0.4"></label>
     <label>Толщина линии <input type="range" id="wt" min="1" max="15" step="1" value="3"></label>
     <label>Прилипание к углам и линиям <input type="checkbox" id="snap" checked></label>
+    <label>Сила упрощения (px) <input type="range" id="simp" min="1" max="30" step="1" value="6"></label>
+    <div class="row">
+      <button id="simpBtn">Упростить выбранное</button>
+      <button id="simpUndo">Вернуть как было</button>
+    </div>
     <div class="row">
       <button id="done">Завершить</button>
       <button id="del">Удалить выбранное</button>
@@ -287,7 +292,12 @@
       a.forEach((p, i) => {
         const h = L.marker(p, { draggable: true, icon: L.divIcon({ className: 'h', iconSize: [12, 12] }) }).addTo(hgrp);
         h.on('drag', e => { const q = snap(e.latlng, s); a[i] = q; h.setLatLng(q); setPts(s, a); });
-        h.on('dragend', () => { save(); showHandles(); });
+        h.on('dragend', () => {
+          const pt = map.latLngToContainerPoint(a[i]);
+          const j = a.findIndex((v, k) => k !== i && map.latLngToContainerPoint(v).distanceTo(pt) < 8);
+          if (j >= 0 && a.length > (poly ? 3 : 2)) { a.splice(i, 1); setPts(s, a); info.textContent = 'Две точки объединены в одну.'; }
+          save(); showHandles();
+        });
         h.on('contextmenu', () => {
           if (a.length > (poly ? 3 : 2)) { a.splice(i, 1); setPts(s, a); save(); showHandles(); }
         });
@@ -307,6 +317,30 @@
         setPts(s, a);
       });
       cm.on('dragend', () => { save(); showHandles(); });
+    }
+
+    // --- Упрощение: слияние густых точек ---
+    let undoSimp = null;
+    function simplifySelected() {
+      if (!selected) { info.textContent = 'Сначала нажмите на объект, который нужно упростить.'; return; }
+      const s = selected, a = getPts(s), poly = s._meta.kind === 'polygon';
+      const pp = a.map((p, i) => { const q = map.latLngToContainerPoint(p); q.i = i; return q; });
+      const out = L.LineUtil.simplify(poly ? pp.concat([pp[0]]) : pp, +$('simp').value);
+      if (poly) out.pop();
+      if (out.length < (poly ? 3 : 2)) { info.textContent = 'Слишком сильное упрощение, уменьшите ползунок.'; return; }
+      undoSimp = { s: s, pts: a };
+      setPts(s, out.map(q => a[q.i]));
+      save(); showHandles();
+      info.textContent = 'Было точек: ' + a.length + ', стало: ' + out.length + '.';
+    }
+    function undoSimplify() {
+      if (!undoSimp || objs.indexOf(undoSimp.s) < 0) { info.textContent = 'Нечего возвращать.'; return; }
+      const s = undoSimp.s;
+      setPts(s, undoSimp.pts);
+      undoSimp = null;
+      save();
+      if (selected === s) showHandles();
+      info.textContent = 'Возвращено как было.';
     }
 
     // --- Прилипание ---
@@ -397,6 +431,8 @@
       });
       $('done').onclick = () => { if (isDraw()) finish(); };
       $('del').onclick = delSelected;
+      $('simpBtn').onclick = simplifySelected;
+      $('simpUndo').onclick = undoSimplify;
       $('addlay').onclick = () => {
         const n = prompt('Название слоя', 'Слой ' + nextL);
         if (n) { activeId = addLayerObj(nextL, n, true).id; save(); renderList(); }
